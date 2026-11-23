@@ -45,6 +45,11 @@ from silero_tts.silero_tts import SileroTTS
 #   True  -> ".?" превращается в "?" (вопросительная интонация)
 MARKER_AS_QUESTION = False
 
+# Что делать с парными запятыми вокруг вводного слова (", кстати, "):
+#   "none" -> " кстати "   : пауз не добавляет, речь слитная (рекомендуется)
+#   "dash" -> " — кстати — ": выразительно, но добавляет по паузе с двух сторон
+INTRO_MODE = "none"
+
 # Список вводных слов можно дополнять: сравнение идёт без учёта регистра,
 # слова берутся только в конструкции "запятая + слово + запятая".
 INTRO_WORDS = [
@@ -86,11 +91,30 @@ _EMOJI_RE = re.compile(
     "]+"
 )
 
+def _replace_intro_none(m):
+    """", кстати, " -> " кстати " """
+    return f" {m.group(1)} "
+
+def _replace_intro_dash(m):
+    """", кстати, " -> " — кстати — "
+
+    Исключение: если тире уже стоит прямо перед словом (авторское тире модели),
+    добавление второго и третьего даёт цепочку вида "— ты — видимо —", на которой
+    голос начинает рубить фразу. В этом случае обе запятые просто убираем.
+    """
+    left = m.string[max(0, m.start() - 6):m.start()]
+    if "—" in left or "–" in left:
+        return f" {m.group(1)} "
+    return f" — {m.group(1)} — "
+
 def prettify_for_tts(text: str) -> str:
     """Готовит текст к синтезу: убирает конструкции, на которых Silero ломает интонацию."""
 
-    # 1. Парные запятые вокруг вводного слова -> тире ("облачно — кстати — температура")
-    text = _INTRO_RE.sub(r" — \1 — ", text)
+    # 1. Парные запятые вокруг вводного слова
+    if INTRO_MODE == "dash":
+        text = _INTRO_RE.sub(_replace_intro_dash, text)
+    else:
+        text = _INTRO_RE.sub(_replace_intro_none, text)
 
     # 2. Скобки -> тире, содержимое сохраняем
     text = re.sub(r"\s*\(([^)]*)\)", r" — \1 — ", text)
@@ -145,6 +169,8 @@ STRESS_DICT = {
     "вторые": "втор+ые",
     "вторых": "втор+ых",
     "вторыми": "втор+ыми",
+    # бывает нужным, когда акцентуатор Silero ставит ударение на "о"
+    "было": "б+ыло",
 }
 
 _STRESS_RE = re.compile(
@@ -201,8 +227,13 @@ app = FastAPI()
 # "v5_5_ru" -> принудительно, настройки интеграции игнорируются
 FORCE_MODEL_ID = "v5_5_ru"
 
+# Как накладывать ручные ударения из STRESS_DICT:
+#   False -> синтез одним куском с put_accent=False (плавно, без лишних пауз)
+#   True  -> текст режется на фразы, склейка через join_wavs (по 100 мс на стыке)
+SPLIT_FOR_STRESS = False
+
 # Пауза между кусками при склейке WAV, миллисекунды.
-# Используется только когда текст режется на фразы ради ручных ударений.
+# Используется только при SPLIT_FOR_STRESS = True.
 PAUSE_BETWEEN_CLAUSES_MS = 100
 
 tts_engine = None
@@ -264,6 +295,14 @@ def generate_tts(req: TTSRequest):
         if not _STRESS_RE.search(clean_text):
             # Словарных слов нет: поведение как раньше
             tts_engine.tts(clean_text, temp_path)
+        elif not SPLIT_FOR_STRESS:
+            # Ручные ударения есть. Текст не режем: отключаем авторасстановку
+            # на весь запрос, чтобы "+" не затирался. Склейка не нужна,
+            # поэтому лишних пауз на стыках не появляется.
+            stressed = apply_stress_dict(clean_text)
+            tts_engine.put_accent = False
+            print(f"Текст с ударениями: '{stressed}'")
+            tts_engine.tts(stressed, temp_path)
         else:
             part_paths = []
             try:
