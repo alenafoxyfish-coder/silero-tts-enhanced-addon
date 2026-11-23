@@ -171,6 +171,11 @@ def join_wavs(paths, out_path, pause_ms=100, fade_ms=15):
 
 app = FastAPI()
 
+# === ПРИНУДИТЕЛЬНАЯ МОДЕЛЬ ===
+# None      -> берём то, что прислала HA-интеграция (сейчас v5_ru)
+# "v5_5_ru" -> принудительно, настройки интеграции игнорируются
+FORCE_MODEL_ID = "v5_5_ru"
+
 tts_engine = None
 current_model = None
 
@@ -187,11 +192,25 @@ class TTSRequest(BaseModel):
 def generate_tts(req: TTSRequest):
     global tts_engine, current_model
     try:
+        # Принудительная модель перебивает то, что прислала HA-интеграция.
+        if FORCE_MODEL_ID:
+            req.model_id = FORCE_MODEL_ID
+
         if tts_engine is None or current_model != req.model_id:
             print(f"Загрузка модели: {req.model_id}")
-            tts_engine = SileroTTS(model_id=req.model_id, language=req.language, speaker=req.voice)
-            current_model = req.model_id
-        
+            try:
+                tts_engine = SileroTTS(model_id=req.model_id, language=req.language, speaker=req.voice)
+                current_model = req.model_id
+            except Exception as model_err:
+                print(f"Не удалось загрузить {req.model_id}: {model_err}")
+                if req.model_id != "v5_ru":
+                    print("Откат на v5_ru")
+                    req.model_id = "v5_ru"
+                    tts_engine = SileroTTS(model_id="v5_ru", language=req.language, speaker=req.voice)
+                    current_model = "v5_ru"
+                else:
+                    raise
+
         tts_engine.put_accent = req.put_accent
         tts_engine.put_yo = req.put_yo
 
@@ -211,7 +230,7 @@ def generate_tts(req: TTSRequest):
 
         print(f"Исходный текст: '{req.text}'")
         print(f"Текст на синтез: '{clean_text}'")
-        print(f"Генерация: голос={req.voice}")
+        print(f"Модель: {current_model}, голос={req.voice}")
 
         if not _STRESS_RE.search(clean_text):
             # Словарных слов нет: поведение как раньше
