@@ -3,6 +3,7 @@ import re
 import wave
 import tempfile
 import shutil
+import array
 from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel
 
@@ -66,13 +67,36 @@ def apply_stress_dict(text: str) -> str:
 def split_clauses(text: str):
     return [p for p in re.split(r"(?<=[.!?…,;:])\s+", text) if p.strip()]
 
-def join_wavs(paths, out_path):
+def join_wavs(paths, out_path, pause_ms=100, fade_ms=15):
     with wave.open(out_path, "wb") as out:
-        for i, p in enumerate(paths):
+        params = None
+        for p in paths:
             with wave.open(p, "rb") as w:
-                if i == 0:
-                    out.setparams(w.getparams())
-                out.writeframes(w.readframes(w.getnframes()))
+                if params is None:
+                    params = w.getparams()
+                    out.setparams(params)
+                rate = w.getframerate()
+                ch = w.getnchannels()
+                width = w.getsampwidth()
+                raw = w.readframes(w.getnframes())
+
+            if width != 2:
+                # неожиданный формат: склеиваем как раньше
+                out.writeframes(raw)
+                continue
+
+            data = array.array("h")
+            data.frombytes(raw)
+            n = min(rate * fade_ms // 1000, len(data) // ch // 2)
+            for i in range(n):
+                k = i / n
+                for c in range(ch):
+                    data[i * ch + c] = int(data[i * ch + c] * k)
+                    j = len(data) - 1 - (i * ch + (ch - 1 - c))
+                    data[j] = int(data[j] * k)
+            out.writeframes(data.tobytes())
+            out.writeframes(b"\x00" * (rate * pause_ms // 1000 * ch * 2))
+
 # ===================================
 
 app = FastAPI()
