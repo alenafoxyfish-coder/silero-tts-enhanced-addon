@@ -35,6 +35,76 @@ except Exception as e:
 
 from silero_tts.silero_tts import SileroTTS
 
+# === ПРЕДОБРАБОТКА ТЕКСТА ДЛЯ TTS ===
+# Silero ломает интонацию на парных запятых вокруг вводных слов, на скобках,
+# на markdown и на повторных знаках. Здесь всё это приводится к виду,
+# который синтезатор читает ровно.
+#
+# Список вводных слов можно дополнять: сравнение идёт по нижнему регистру,
+# слова берутся только в конструкции "запятая + слово + запятая".
+INTRO_WORDS = [
+    "к сожалению", "к счастью", "кроме того", "более того", "таким образом",
+    "как правило", "в свою очередь", "честно говоря", "короче говоря",
+    "к тому же", "в общем", "во-первых", "во-вторых", "в-третьих",
+    "по-моему", "по-твоему", "наверное", "возможно", "вероятно",
+    "действительно", "собственно", "например", "кстати", "конечно",
+    "итак", "впрочем", "однако", "правда", "причём", "причем", "словом",
+    "кажется", "пожалуй", "разумеется", "безусловно", "естественно",
+    "впрочем", "напротив", "наоборот", "точнее", "вернее", "буквально",
+]
+
+_INTRO_RE = re.compile(
+    r",\s*(" + "|".join(sorted(map(re.escape, INTRO_WORDS), key=len, reverse=True)) + r")\s*,",
+    re.IGNORECASE,
+)
+
+# Эмодзи и пиктограммы: синтезатор их либо пропускает с паузой, либо читает вслух
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"   # эмодзи, пиктограммы
+    "\U00002600-\U000027BF"   # символы и дингбаты
+    "\U0001F1E6-\U0001F1FF"   # флаги
+    "\u2190-\u21FF"           # стрелки
+    "\u2B00-\u2BFF"           # разные символы
+    "\uFE0F\u200D\u20E3"      # модификаторы эмодзи
+    "]+"
+)
+
+def prettify_for_tts(text: str) -> str:
+    """Готовит текст к синтезу: убирает конструкции, на которых Silero ломает интонацию."""
+
+    # 1. Парные запятые вокруг вводного слова -> тире ("облачно — кстати — температура")
+    text = _INTRO_RE.sub(r" — \1 — ", text)
+
+    # 2. Скобки -> тире, содержимое сохраняем
+    text = re.sub(r"\s*\(([^)]*)\)", r" — \1 — ", text)
+
+    # 3. Markdown: ссылки, URL, жирный, заголовки, списки, маркеры
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "ссылка", text)
+    text = re.sub(r"[*_#`>|]+", " ", text)
+    text = re.sub(r"[•·▪◦]+", " ", text)
+
+    # 4. Многоточие -> точка
+    text = text.replace("…", ".").replace("...", ".")
+
+    # 5. Эмодзи
+    text = _EMOJI_RE.sub("", text)
+
+    # 6. Повторные знаки: "!!" -> "!", "??" -> "?"
+    text = re.sub(r"([!?.])\1+", r"\1", text)
+
+    # 7. Тире: нормализуем пробелы, убираем двойные и висячие перед знаком
+    text = re.sub(r"\s*[—–]\s*", " — ", text)
+    text = re.sub(r"(\s—\s*){2,}", " — ", text)
+    text = re.sub(r"\s*—\s*(?=[.!?,;:])", "", text)
+    text = re.sub(r"^[\s—]+", "", text)
+    text = re.sub(r"[\s—]+$", "", text)
+
+    # 8. Лишние пробелы
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 # === СЛОВАРЬ УДАРЕНИЙ-ИСКЛЮЧЕНИЙ ===
 # Формат: "слово в нижнем регистре": "слово с + перед ударной гласной",
 # Каждая строка заканчивается запятой. Ударения сверяйте по орфоэпическому словарю.
@@ -133,18 +203,23 @@ def generate_tts(req: TTSRequest):
         if hasattr(tts_engine, 'change_sample_rate'):
             tts_engine.change_sample_rate(req.sample_rate)
 
+        # === ПРЕДОБРАБОТКА: обязательно ДО словаря ударений ===
+        clean_text = prettify_for_tts(req.text)
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             temp_path = tmp.name
 
-        print(f"Генерация: текст='{req.text}', голос={req.voice}")
+        print(f"Исходный текст: '{req.text}'")
+        print(f"Текст на синтез: '{clean_text}'")
+        print(f"Генерация: голос={req.voice}")
 
-        if not _STRESS_RE.search(req.text):
+        if not _STRESS_RE.search(clean_text):
             # Словарных слов нет: поведение как раньше
-            tts_engine.tts(req.text, temp_path)
+            tts_engine.tts(clean_text, temp_path)
         else:
             part_paths = []
             try:
-                for clause in split_clauses(req.text):
+                for clause in split_clauses(clean_text):
                     fixed = apply_stress_dict(clause)
                     manual = fixed != clause
                     # во фразах со словарным словом отключаем авторасстановку,
